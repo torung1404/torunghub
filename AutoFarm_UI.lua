@@ -1,459 +1,453 @@
---// =========================================================
---// FILE: AutoFarm_UI.lua   (LEGIT TEMPLATE: ToRungHub UI + hop persistence)
---// Purpose: Client UI framework + continuous config save + hop server keep config.
---// Notes:
---//  - Persists across server-hop/teleport (TeleportData)
---//  - Persists within same session (PlayerGui Attribute)
---//  - Does NOT persist after leaving the game (true out/in) without DataStore/backend
---// =========================================================
+-- =========================================================
+-- FILE 1/4: StarterPlayerScripts/AutoFarm_UI.lua  (LocalScript)
+-- ToRungHub UI + continuous save + hop persistence (TeleportData)
+-- =========================================================
 
---!strict
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
+local Players = game:GetService('Players')
+local UserInputService = game:GetService('UserInputService')
+local TeleportService = game:GetService('TeleportService')
+local HttpService = game:GetService('HttpService')
+local RunService = game:GetService('RunService')
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
 
-local LOCAL_PLAYER = Players.LocalPlayer
+local plr = Players.LocalPlayer
 
--- =========================
--- Config (edit keys freely)
--- =========================
-local CONFIG_KEY = "ToRungHubCfgV1"
-local SESSION_ATTR = "ToRungHubCfgJson"
+local HUB_NAME = 'ToRungHub'
+local TELEPORT_KEY = 'ToRungHubCfgV1'
+local SESSION_ATTR = 'ToRungHubCfgJson'
+local REMOTE_NAME = 'ToRungHubControl'
 
-local DEFAULT_CONFIG = {
+local DEFAULT = {
 	v = 1,
 	ui = {
 		visible = true,
 		minimized = false,
 		locked = false,
-		tab = "Home",
+		tab = 'Home',
+		opacity = 0.18, -- 0..0.6 (higher = more see-through)
 		pos = { xScale = 0, xOffset = 18, yScale = 0.35, yOffset = 0 },
-		opacity = 0.16, -- 0..0.6
 	},
-	toggles = {
-		Enabled = false, -- "start"
-		OptionA = false,
-		OptionB = true,
-		OptionC = false,
-	},
-	sliders = {
+	autofarm = {
+		Enabled = false,
+		BossOnly = false,
 		Radius = 3000,
-		Speed = 50,
+		FollowDist = 6,
+		AttackCD = 0.2,
 	},
 }
 
-local MAX_DEPTH = 4
-local MAX_KEYS = 256
+local MAX_DEPTH, MAX_KEYS = 4, 256
 
-local function deepCopy(v: any, depth: number?): any
+local function clamp(n, a, b)
+	return math.max(a, math.min(b, n))
+end
+
+local function deepCopy(v, depth)
 	depth = depth or 0
-	if depth > MAX_DEPTH then
-		return nil
-	end
-	if typeof(v) ~= "table" then
-		return v
-	end
-	local out = {}
-	local n = 0
+	if depth > MAX_DEPTH then return nil end
+	if typeof(v) ~= 'table' then return v end
+	local out, n = {}, 0
 	for k, vv in pairs(v) do
 		n += 1
-		if n > MAX_KEYS then
-			break
-		end
+		if n > MAX_KEYS then break end
 		out[deepCopy(k, depth + 1)] = deepCopy(vv, depth + 1)
 	end
 	return out
 end
 
-local function sanitize(v: any, depth: number?): any
+local function sanitize(v, depth)
 	depth = depth or 0
-	if depth > MAX_DEPTH then
-		return nil
-	end
+	if depth > MAX_DEPTH then return nil end
+
 	local t = typeof(v)
-	if t == "boolean" or t == "number" or t == "string" then
-		return v
-	end
-	if t ~= "table" then
-		return nil
-	end
-	local out = {}
-	local n = 0
+	if t == 'boolean' or t == 'number' or t == 'string' then return v end
+	if t ~= 'table' then return nil end
+
+	local out, n = {}, 0
 	for k, vv in pairs(v) do
 		n += 1
-		if n > MAX_KEYS then
-			break
-		end
+		if n > MAX_KEYS then break end
 		local kt = typeof(k)
-		if kt == "string" or kt == "number" then
+		if kt == 'string' or kt == 'number' then
 			local sv = sanitize(vv, depth + 1)
-			if sv ~= nil then
-				out[k] = sv
-			end
+			if sv ~= nil then out[k] = sv end
 		end
 	end
 	return out
 end
 
-local function getPlayerGui(): PlayerGui?
-	return LOCAL_PLAYER:FindFirstChildOfClass("PlayerGui")
+local function getPlayerGui()
+	return plr:FindFirstChildOfClass('PlayerGui')
 end
 
-local function safeJsonEncode(t: any): (boolean, string)
-	local ok, res = pcall(function()
-		return HttpService:JSONEncode(t)
-	end)
-	return ok, ok and res or ""
+local function udim2FromTbl(t)
+	if typeof(t) ~= 'table' then return nil end
+	local xs, xo = tonumber(t.xScale), tonumber(t.xOffset)
+	local ys, yo = tonumber(t.yScale), tonumber(t.yOffset)
+	if not (xs and xo and ys and yo) then return nil end
+	return UDim2.new(xs, xo, ys, yo)
 end
 
-local function safeJsonDecode(s: string): (boolean, any)
-	local ok, res = pcall(function()
-		return HttpService:JSONDecode(s)
-	end)
+local function tblFromUdim2(u)
+	return { xScale = u.X.Scale, xOffset = u.X.Offset, yScale = u.Y.Scale, yOffset = u.Y.Offset }
+end
+
+local function safeEncode(t)
+	local ok, res = pcall(function() return HttpService:JSONEncode(t) end)
+	return ok, ok and res or ''
+end
+
+local function safeDecode(s)
+	local ok, res = pcall(function() return HttpService:JSONDecode(s) end)
 	return ok, res
 end
 
 -- =========================
--- Config Manager (client-only)
+-- Config manager
 -- =========================
-local Config = {}
-Config.__index = Config
+local Cfg = {}
+Cfg.__index = Cfg
 
-function Config.new(defaultCfg: table)
-	local self = setmetatable({}, Config)
+function Cfg.new(defaultCfg)
+	local self = setmetatable({}, Cfg)
 	self._cfg = sanitize(defaultCfg, 0) or {}
 	self._saveToken = 0
-	self._lastSavedJson = ""
+	self._lastJson = ''
+	self._remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
 	return self
 end
 
-function Config:Get(): table
+function Cfg:Get()
 	return deepCopy(self._cfg, 0) or {}
 end
 
-function Config:Set(newCfg: table)
-	self._cfg = sanitize(newCfg, 0) or {}
+function Cfg:Set(t)
+	self._cfg = sanitize(t, 0) or {}
 end
 
-function Config:_saveToSessionAttr(payload: table)
+function Cfg:_saveSession()
 	local pg = getPlayerGui()
-	if not pg then
-		return
-	end
-	local ok, json = safeJsonEncode(payload)
-	if not ok then
-		return
-	end
-	if json == self._lastSavedJson then
-		return
-	end
-	self._lastSavedJson = json
+	if not pg then return end
+	local ok, json = safeEncode(self._cfg)
+	if not ok or json == self._lastJson then return end
+	self._lastJson = json
 	pg:SetAttribute(SESSION_ATTR, json)
 end
 
-function Config:SaveDebounced(onStatus: ((string) -> ())?)
-	self._saveToken += 1
-	local token = self._saveToken
-	if onStatus then
-		onStatus("Saving…")
+function Cfg:_loadTeleportData()
+	local ok, joinData = pcall(function() return plr:GetJoinData() end)
+	if not ok or typeof(joinData) ~= 'table' then return nil end
+	local td = joinData.TeleportData
+	if typeof(td) ~= 'table' then return nil end
+	local payload = td[TELEPORT_KEY]
+	if typeof(payload) ~= 'table' then return nil end
+	return sanitize(payload, 0)
+end
+
+function Cfg:_loadSession()
+	local pg = getPlayerGui()
+	if not pg then return nil end
+	local json = pg:GetAttribute(SESSION_ATTR)
+	if typeof(json) ~= 'string' or #json == 0 then return nil end
+	local ok, decoded = safeDecode(json)
+	if not ok or typeof(decoded) ~= 'table' then return nil end
+	return sanitize(decoded, 0)
+end
+
+function Cfg:LoadInitial()
+	local a = self:_loadTeleportData()
+	if a then
+		self._cfg = a
+		self:_saveSession()
+		return
 	end
 
+	local b = self:_loadSession()
+	if b then
+		self._cfg = b
+		return
+	end
+
+	self._cfg = sanitize(DEFAULT, 0) or {}
+	self:_saveSession()
+end
+
+function Cfg:GetTeleportData()
+	return { [TELEPORT_KEY] = self:Get() }
+end
+
+function Cfg:SaveDebounced(onStatus)
+	self._saveToken += 1
+	local token = self._saveToken
+	if onStatus then onStatus('Saving…') end
+
 	task.delay(0.2, function()
-		if token ~= self._saveToken then
-			return
+		if token ~= self._saveToken then return end
+		self:_saveSession()
+
+		local remote = self._remote
+		if remote and remote:IsA('RemoteEvent') then
+			remote:FireServer('Config', self:Get())
 		end
-		self:_saveToSessionAttr(self._cfg)
+
 		if onStatus then
-			onStatus("Saved")
-			task.delay(1.0, function()
-				onStatus("")
-			end)
+			onStatus('Saved')
+			task.delay(0.9, function() onStatus('') end)
 		end
 	end)
 end
 
-function Config:LoadInitial()
-	-- 1) TeleportData (hop server / teleport)
-	do
-		local ok, joinData = pcall(function()
-			return LOCAL_PLAYER:GetJoinData()
-		end)
-		if ok and typeof(joinData) == "table" and typeof(joinData.TeleportData) == "table" then
-			local td = joinData.TeleportData
-			local payload = td[CONFIG_KEY]
-			if typeof(payload) == "table" then
-				local s = sanitize(payload, 0)
-				if s then
-					self._cfg = s
-					self:_saveToSessionAttr(self._cfg)
-					return
-				end
-			end
-		end
+function Cfg:SaveImmediate(onStatus)
+	self._saveToken += 1
+	self:_saveSession()
+
+	local remote = self._remote
+	if remote and remote:IsA('RemoteEvent') then
+		remote:FireServer('Config', self:Get())
 	end
 
-	-- 2) Session attribute (same session survive UI reload/respawn)
-	do
-		local pg = getPlayerGui()
-		if pg then
-			local json = pg:GetAttribute(SESSION_ATTR)
-			if typeof(json) == "string" and #json > 0 then
-				local ok, decoded = safeJsonDecode(json)
-				if ok and typeof(decoded) == "table" then
-					local s = sanitize(decoded, 0)
-					if s then
-						self._cfg = s
-						return
-					end
-				end
-			end
-		end
+	if onStatus then
+		onStatus('Saved')
+		task.delay(0.9, function() onStatus('') end)
 	end
-
-	-- 3) Default
-	self._cfg = sanitize(DEFAULT_CONFIG, 0) or {}
-	self:_saveToSessionAttr(self._cfg)
 end
 
-function Config:GetTeleportData(): table
-	return {
-		[CONFIG_KEY] = self:Get(),
-	}
-end
-
-function Config:Teleport(placeId: number, jobId: string?)
-	local td = self:GetTeleportData()
-	if typeof(jobId) == "string" and #jobId > 0 then
-		TeleportService:TeleportToPlaceInstance(placeId, jobId, LOCAL_PLAYER, td)
+function Cfg:Teleport(placeId, jobId)
+	local data = self:GetTeleportData()
+	if typeof(jobId) == 'string' and #jobId > 0 then
+		TeleportService:TeleportToPlaceInstance(placeId, jobId, plr, data)
 	else
-		TeleportService:Teleport(placeId, LOCAL_PLAYER, td)
+		TeleportService:Teleport(placeId, plr, data)
 	end
 end
 
-local cfg = Config.new(DEFAULT_CONFIG)
+local cfg = Cfg.new(DEFAULT)
 cfg:LoadInitial()
 
 -- =========================
--- UI Helpers
+-- UI builder
 -- =========================
-local function udim2FromTbl(t: any): UDim2?
-	if typeof(t) ~= "table" then
-		return nil
-	end
-	local xs = tonumber(t.xScale)
-	local xo = tonumber(t.xOffset)
-	local ys = tonumber(t.yScale)
-	local yo = tonumber(t.yOffset)
-	if not (xs and xo and ys and yo) then
-		return nil
-	end
-	return UDim2.new(xs, xo, ys, yo)
-end
+local pg = getPlayerGui() or plr:WaitForChild('PlayerGui')
 
-local function tblFromUdim2(u: UDim2): table
-	return {
-		xScale = u.X.Scale,
-		xOffset = u.X.Offset,
-		yScale = u.Y.Scale,
-		yOffset = u.Y.Offset,
-	}
-end
+local existing = pg:FindFirstChild(HUB_NAME)
+if existing then existing:Destroy() end
 
-local function clamp(n: number, a: number, b: number): number
-	return math.max(a, math.min(b, n))
-end
+local uiCfg = cfg:Get().ui or {}
+local opacity = clamp(tonumber(uiCfg.opacity) or DEFAULT.ui.opacity, 0, 0.6)
 
-local function themeOpacity(): number
-	local c = cfg:Get()
-	local op = tonumber(((c.ui or {}).opacity)) or DEFAULT_CONFIG.ui.opacity
-	return clamp(op, 0, 0.6)
-end
-
--- =========================
--- Build UI (ToRungHub style)
--- =========================
-local playerGui = getPlayerGui() or LOCAL_PLAYER:WaitForChild("PlayerGui")
-
--- ensure only 1 instance
-local old = playerGui:FindFirstChild("ToRungHub")
-if old then
-	old:Destroy()
-end
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "ToRungHub"
+local gui = Instance.new('ScreenGui')
+gui.Name = HUB_NAME
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
-gui.Parent = playerGui
+gui.Parent = pg
 
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.Parent = gui
-main.Size = UDim2.fromOffset(460, 320)
-main.Position = udim2FromTbl((cfg:Get().ui or {}).pos) or UDim2.new(0, 18, 0.35, 0)
-main.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
-main.BackgroundTransparency = themeOpacity()
-main.BorderSizePixel = 0
-main.Active = true
-
-local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 12)
-mainCorner.Parent = main
-
-local stroke = Instance.new("UIStroke")
-stroke.Parent = main
-stroke.Thickness = 1
-stroke.Color = Color3.fromRGB(255, 255, 255)
-stroke.Transparency = 0.82
-
-local shadow = Instance.new("Frame")
-shadow.Name = "Shadow"
+local shadow = Instance.new('Frame')
+shadow.Name = 'Shadow'
 shadow.Parent = gui
-shadow.Size = main.Size
-shadow.Position = main.Position + UDim2.fromOffset(6, 6)
 shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-shadow.BackgroundTransparency = 0.65
+shadow.BackgroundTransparency = 0.68
 shadow.BorderSizePixel = 0
-shadow.ZIndex = main.ZIndex - 1
+shadow.ZIndex = 0
 
-local shadowCorner = Instance.new("UICorner")
+local shadowCorner = Instance.new('UICorner')
 shadowCorner.CornerRadius = UDim.new(0, 14)
 shadowCorner.Parent = shadow
 
-local top = Instance.new("Frame")
-top.Name = "Topbar"
+local main = Instance.new('Frame')
+main.Name = 'Main'
+main.Parent = gui
+main.Size = UDim2.fromOffset(520, 360)
+main.Position = udim2FromTbl(uiCfg.pos) or UDim2.new(0, 18, 0.35, 0)
+main.BackgroundColor3 = Color3.fromRGB(16, 16, 16)
+main.BackgroundTransparency = opacity
+main.BorderSizePixel = 0
+main.Active = true
+main.ZIndex = 2
+
+local mainCorner = Instance.new('UICorner')
+mainCorner.CornerRadius = UDim.new(0, 12)
+mainCorner.Parent = main
+
+local mainStroke = Instance.new('UIStroke')
+mainStroke.Parent = main
+mainStroke.Thickness = 1
+mainStroke.Color = Color3.fromRGB(255, 255, 255)
+mainStroke.Transparency = 0.84
+
+local top = Instance.new('Frame')
+top.Name = 'Top'
 top.Parent = main
-top.Size = UDim2.new(1, 0, 0, 34)
+top.Size = UDim2.new(1, 0, 0, 36)
 top.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
-top.BackgroundTransparency = themeOpacity()
+top.BackgroundTransparency = opacity
 top.BorderSizePixel = 0
 
-local topCorner = Instance.new("UICorner")
+local topCorner = Instance.new('UICorner')
 topCorner.CornerRadius = UDim.new(0, 12)
 topCorner.Parent = top
 
-local title = Instance.new("TextLabel")
+local title = Instance.new('TextLabel')
 title.Parent = top
 title.BackgroundTransparency = 1
 title.Position = UDim2.fromOffset(12, 0)
-title.Size = UDim2.new(1, -160, 1, 0)
+title.Size = UDim2.new(1, -220, 1, 0)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 14
+title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.fromRGB(240, 240, 240)
-title.Text = "ToRungHub"
+title.TextColor3 = Color3.fromRGB(245, 245, 245)
+title.Text = HUB_NAME
 
-local saveLbl = Instance.new("TextLabel")
-saveLbl.Parent = top
-saveLbl.BackgroundTransparency = 1
-saveLbl.Position = UDim2.new(1, -240, 0, 0)
-saveLbl.Size = UDim2.fromOffset(120, 34)
-saveLbl.Font = Enum.Font.Gotham
-saveLbl.TextSize = 12
-saveLbl.TextXAlignment = Enum.TextXAlignment.Right
-saveLbl.TextColor3 = Color3.fromRGB(175, 175, 175)
-saveLbl.Text = ""
+local statusLbl = Instance.new('TextLabel')
+statusLbl.Parent = top
+statusLbl.BackgroundTransparency = 1
+statusLbl.Position = UDim2.new(1, -240, 0, 0)
+statusLbl.Size = UDim2.fromOffset(120, 36)
+statusLbl.Font = Enum.Font.Gotham
+statusLbl.TextSize = 12
+statusLbl.TextXAlignment = Enum.TextXAlignment.Right
+statusLbl.TextColor3 = Color3.fromRGB(175, 175, 175)
+statusLbl.Text = ''
 
-local function setStatus(s: string)
-	saveLbl.Text = s
-end
+local function setStatus(s) statusLbl.Text = s or '' end
 
-local function mkTopBtn(text: string, xRight: number): TextButton
-	local b = Instance.new("TextButton")
+local function mkTopBtn(txt, right)
+	local b = Instance.new('TextButton')
 	b.Parent = top
-	b.Size = UDim2.fromOffset(34, 34)
-	b.Position = UDim2.new(1, -xRight, 0, 0)
+	b.Size = UDim2.fromOffset(36, 36)
+	b.Position = UDim2.new(1, -right, 0, 0)
 	b.BackgroundTransparency = 1
 	b.Font = Enum.Font.GothamBold
-	b.TextSize = 14
-	b.TextColor3 = Color3.fromRGB(230, 230, 230)
-	b.Text = text
+	b.TextSize = 16
+	b.TextColor3 = Color3.fromRGB(235, 235, 235)
+	b.Text = txt
 	return b
 end
 
-local btnClose = mkTopBtn("×", 34)
-local btnMin = mkTopBtn("–", 68)
-local btnLock = mkTopBtn("🔓", 102)
+local btnMin = mkTopBtn('–', 72)
+local btnClose = mkTopBtn('×', 36)
+local btnLock = mkTopBtn('🔓', 108)
 
-local body = Instance.new("Frame")
+local body = Instance.new('Frame')
 body.Parent = main
-body.Position = UDim2.new(0, 0, 0, 34)
-body.Size = UDim2.new(1, 0, 1, -34)
+body.Position = UDim2.new(0, 0, 0, 36)
+body.Size = UDim2.new(1, 0, 1, -36)
 body.BackgroundTransparency = 1
 
-local sidebar = Instance.new("Frame")
+local sidebar = Instance.new('Frame')
 sidebar.Parent = body
-sidebar.Size = UDim2.fromOffset(140, 286)
+sidebar.Size = UDim2.fromOffset(150, 324)
 sidebar.Position = UDim2.fromOffset(0, 0)
 sidebar.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
-sidebar.BackgroundTransparency = themeOpacity()
+sidebar.BackgroundTransparency = opacity
 sidebar.BorderSizePixel = 0
 
-local sideStroke = Instance.new("UIStroke")
+local sideStroke = Instance.new('UIStroke')
 sideStroke.Parent = sidebar
 sideStroke.Thickness = 1
 sideStroke.Color = Color3.fromRGB(255, 255, 255)
-sideStroke.Transparency = 0.9
+sideStroke.Transparency = 0.92
 
-local sidePad = Instance.new("UIPadding")
+local sidePad = Instance.new('UIPadding')
 sidePad.Parent = sidebar
 sidePad.PaddingTop = UDim.new(0, 10)
 sidePad.PaddingLeft = UDim.new(0, 10)
 sidePad.PaddingRight = UDim.new(0, 10)
 
-local sideList = Instance.new("UIListLayout")
+local sideList = Instance.new('UIListLayout')
 sideList.Parent = sidebar
 sideList.Padding = UDim.new(0, 8)
-sideList.FillDirection = Enum.FillDirection.Vertical
 sideList.SortOrder = Enum.SortOrder.LayoutOrder
 
-local content = Instance.new("Frame")
-content.Parent = body
-content.Position = UDim2.fromOffset(140, 0)
-content.Size = UDim2.new(1, -140, 1, 0)
-content.BackgroundTransparency = 1
+local pagesHost = Instance.new('Frame')
+pagesHost.Parent = body
+pagesHost.Position = UDim2.fromOffset(150, 0)
+pagesHost.Size = UDim2.new(1, -150, 1, 0)
+pagesHost.BackgroundTransparency = 1
 
-local pages = Instance.new("Frame")
-pages.Parent = content
-pages.Size = UDim2.new(1, -12, 1, -12)
-pages.Position = UDim2.fromOffset(6, 6)
-pages.BackgroundTransparency = 1
+local pagesPad = Instance.new('UIPadding')
+pagesPad.Parent = pagesHost
+pagesPad.PaddingTop = UDim.new(0, 10)
+pagesPad.PaddingLeft = UDim.new(0, 10)
+pagesPad.PaddingRight = UDim.new(0, 10)
+pagesPad.PaddingBottom = UDim.new(0, 10)
 
-local function mkPage(name: string): ScrollingFrame
-	local p = Instance.new("ScrollingFrame")
+local function mkPage(name)
+	local p = Instance.new('ScrollingFrame')
 	p.Name = name
-	p.Parent = pages
+	p.Parent = pagesHost
 	p.Size = UDim2.new(1, 0, 1, 0)
 	p.BackgroundTransparency = 1
 	p.BorderSizePixel = 0
 	p.ScrollBarThickness = 4
 	p.Visible = false
-	p.CanvasSize = UDim2.new(0, 0, 0, 0)
 	p.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	p.CanvasSize = UDim2.new(0, 0, 0, 0)
 
-	local layout = Instance.new("UIListLayout")
+	local layout = Instance.new('UIListLayout')
 	layout.Parent = p
 	layout.Padding = UDim.new(0, 10)
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 
-	local pad = Instance.new("UIPadding")
-	pad.Parent = p
-	pad.PaddingTop = UDim.new(0, 6)
-	pad.PaddingLeft = UDim.new(0, 6)
-	pad.PaddingRight = UDim.new(0, 6)
-	pad.PaddingBottom = UDim.new(0, 6)
-
 	return p
 end
 
-local pageHome = mkPage("Home")
-local pageSettings = mkPage("Settings")
-local pageTeleport = mkPage("Teleport")
+local pageHome = mkPage('Home')
+local pageAuto = mkPage('AutoFarm')
+local pageTeleport = mkPage('Teleport')
+local pageSettings = mkPage('Settings')
 
-local function mkHeaderText(parent: Instance, text: string)
-	local t = Instance.new("TextLabel")
+local tabButtons = {}
+local tabs = {
+	Home = pageHome,
+	AutoFarm = pageAuto,
+	Teleport = pageTeleport,
+	Settings = pageSettings,
+}
+
+local function mkTabButton(name)
+	local b = Instance.new('TextButton')
+	b.Parent = sidebar
+	b.Size = UDim2.new(1, 0, 0, 34)
+	b.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+	b.BackgroundTransparency = opacity
+	b.BorderSizePixel = 0
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.TextColor3 = Color3.fromRGB(170, 170, 170)
+	b.Text = '  ' .. name
+
+	local cr = Instance.new('UICorner')
+	cr.CornerRadius = UDim.new(0, 10)
+	cr.Parent = b
+
+	tabButtons[name] = b
+	return b
+end
+
+local function setTab(name)
+	for tabName, page in pairs(tabs) do
+		page.Visible = (tabName == name)
+		local b = tabButtons[tabName]
+		if b then
+			b.TextColor3 = (tabName == name) and Color3.fromRGB(245, 245, 245) or Color3.fromRGB(170, 170, 170)
+		end
+	end
+	local c = cfg:Get()
+	c.ui = c.ui or {}
+	c.ui.tab = name
+	cfg:Set(c)
+	cfg:SaveDebounced(setStatus)
+end
+
+for _, name in ipairs({ 'Home', 'AutoFarm', 'Teleport', 'Settings' }) do
+	mkTabButton(name).MouseButton1Click:Connect(function()
+		setTab(name)
+	end)
+end
+
+local function mkHeader(parent, text)
+	local t = Instance.new('TextLabel')
 	t.Parent = parent
 	t.BackgroundTransparency = 1
 	t.Size = UDim2.new(1, 0, 0, 18)
@@ -465,45 +459,45 @@ local function mkHeaderText(parent: Instance, text: string)
 	return t
 end
 
-local function mkNote(parent: Instance, text: string)
-	local t = Instance.new("TextLabel")
+local function mkNote(parent, text)
+	local t = Instance.new('TextLabel')
 	t.Parent = parent
 	t.BackgroundTransparency = 1
-	t.Size = UDim2.new(1, 0, 0, 32)
+	t.Size = UDim2.new(1, 0, 0, 34)
 	t.Font = Enum.Font.Gotham
 	t.TextSize = 12
 	t.TextWrapped = true
 	t.TextXAlignment = Enum.TextXAlignment.Left
-	t.TextColor3 = Color3.fromRGB(170, 170, 170)
+	t.TextColor3 = Color3.fromRGB(175, 175, 175)
 	t.Text = text
 	return t
 end
 
-local function mkRow(parent: Instance)
-	local row = Instance.new("Frame")
+local function mkRow(parent, height)
+	local row = Instance.new('Frame')
 	row.Parent = parent
-	row.Size = UDim2.new(1, 0, 0, 40)
+	row.Size = UDim2.new(1, 0, 0, height or 42)
 	row.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-	row.BackgroundTransparency = themeOpacity()
+	row.BackgroundTransparency = opacity
 	row.BorderSizePixel = 0
 
-	local cr = Instance.new("UICorner")
+	local cr = Instance.new('UICorner')
 	cr.CornerRadius = UDim.new(0, 10)
 	cr.Parent = row
 
-	local st = Instance.new("UIStroke")
+	local st = Instance.new('UIStroke')
 	st.Parent = row
 	st.Thickness = 1
 	st.Color = Color3.fromRGB(255, 255, 255)
-	st.Transparency = 0.92
+	st.Transparency = 0.94
 
 	return row
 end
 
-local function mkToggle(parent: Instance, label: string, getter: () -> boolean, setter: (boolean) -> ())
-	local row = mkRow(parent)
+local function mkToggle(parent, label, getFn, setFn)
+	local row = mkRow(parent, 42)
 
-	local txt = Instance.new("TextLabel")
+	local txt = Instance.new('TextLabel')
 	txt.Parent = row
 	txt.BackgroundTransparency = 1
 	txt.Position = UDim2.fromOffset(12, 0)
@@ -514,28 +508,28 @@ local function mkToggle(parent: Instance, label: string, getter: () -> boolean, 
 	txt.TextColor3 = Color3.fromRGB(225, 225, 225)
 	txt.Text = label
 
-	local btn = Instance.new("TextButton")
+	local btn = Instance.new('TextButton')
 	btn.Parent = row
 	btn.Size = UDim2.fromOffset(58, 24)
 	btn.Position = UDim2.new(1, -70, 0.5, -12)
 	btn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-	btn.BackgroundTransparency = themeOpacity()
+	btn.BackgroundTransparency = opacity
 	btn.BorderSizePixel = 0
 	btn.Font = Enum.Font.GothamBold
 	btn.TextSize = 12
 
-	local bcr = Instance.new("UICorner")
-	bcr.CornerRadius = UDim.new(0, 999)
-	bcr.Parent = btn
+	local cr = Instance.new('UICorner')
+	cr.CornerRadius = UDim.new(0, 999)
+	cr.Parent = btn
 
 	local function refresh()
-		local on = getter()
-		btn.Text = on and "ON" or "OFF"
+		local on = (getFn() == true)
+		btn.Text = on and 'ON' or 'OFF'
 		btn.TextColor3 = on and Color3.fromRGB(140, 255, 140) or Color3.fromRGB(255, 170, 170)
 	end
 
 	btn.MouseButton1Click:Connect(function()
-		setter(not getter())
+		setFn(not getFn())
 		refresh()
 		cfg:SaveDebounced(setStatus)
 	end)
@@ -544,72 +538,69 @@ local function mkToggle(parent: Instance, label: string, getter: () -> boolean, 
 	return refresh
 end
 
-local function mkSlider(parent: Instance, label: string, minV: number, maxV: number, step: number, getter: () -> number, setter: (number) -> ())
-	local row = mkRow(parent)
-	row.Size = UDim2.new(1, 0, 0, 52)
+local function mkSlider(parent, label, minV, maxV, step, getFn, setFn)
+	local row = mkRow(parent, 54)
 
-	local txt = Instance.new("TextLabel")
+	local txt = Instance.new('TextLabel')
 	txt.Parent = row
 	txt.BackgroundTransparency = 1
 	txt.Position = UDim2.fromOffset(12, 6)
-	txt.Size = UDim2.new(1, -24, 0, 16)
+	txt.Size = UDim2.new(1, -120, 0, 16)
 	txt.Font = Enum.Font.Gotham
 	txt.TextSize = 12
 	txt.TextXAlignment = Enum.TextXAlignment.Left
 	txt.TextColor3 = Color3.fromRGB(225, 225, 225)
 	txt.Text = label
 
-	local valueLbl = Instance.new("TextLabel")
+	local valueLbl = Instance.new('TextLabel')
 	valueLbl.Parent = row
 	valueLbl.BackgroundTransparency = 1
-	valueLbl.Position = UDim2.new(1, -90, 6, 0)
-	valueLbl.Size = UDim2.fromOffset(78, 16)
+	valueLbl.Position = UDim2.new(1, -110, 6, 0)
+	valueLbl.Size = UDim2.fromOffset(96, 16)
 	valueLbl.Font = Enum.Font.Gotham
 	valueLbl.TextSize = 12
 	valueLbl.TextXAlignment = Enum.TextXAlignment.Right
-	valueLbl.TextColor3 = Color3.fromRGB(180, 180, 180)
-	valueLbl.Text = ""
+	valueLbl.TextColor3 = Color3.fromRGB(175, 175, 175)
 
-	local bar = Instance.new("Frame")
+	local bar = Instance.new('Frame')
 	bar.Parent = row
-	bar.Position = UDim2.fromOffset(12, 30)
+	bar.Position = UDim2.fromOffset(12, 32)
 	bar.Size = UDim2.new(1, -24, 0, 10)
 	bar.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
-	bar.BackgroundTransparency = themeOpacity()
+	bar.BackgroundTransparency = opacity
 	bar.BorderSizePixel = 0
 
-	local barCorner = Instance.new("UICorner")
-	barCorner.CornerRadius = UDim.new(0, 999)
-	barCorner.Parent = bar
+	local barCr = Instance.new('UICorner')
+	barCr.CornerRadius = UDim.new(0, 999)
+	barCr.Parent = bar
 
-	local fill = Instance.new("Frame")
+	local fill = Instance.new('Frame')
 	fill.Parent = bar
-	fill.Size = UDim2.new(0, 0, 1, 0)
 	fill.BackgroundColor3 = Color3.fromRGB(200, 200, 200)
 	fill.BackgroundTransparency = 0.45
 	fill.BorderSizePixel = 0
+	fill.Size = UDim2.new(0, 0, 1, 0)
 
-	local fillCorner = Instance.new("UICorner")
-	fillCorner.CornerRadius = UDim.new(0, 999)
-	fillCorner.Parent = fill
+	local fillCr = Instance.new('UICorner')
+	fillCr.CornerRadius = UDim.new(0, 999)
+	fillCr.Parent = fill
 
 	local dragging = false
 
-	local function snap(v: number): number
-		local s = math.max(1e-9, step)
+	local function snap(v)
+		local s = math.max(1e-9, step or 1)
 		return math.floor((v / s) + 0.5) * s
 	end
 
-	local function setFromAlpha(a: number)
+	local function setFromAlpha(a)
 		a = clamp(a, 0, 1)
-		local val = minV + (maxV - minV) * a
-		val = snap(val)
-		val = clamp(val, minV, maxV)
-		setter(val)
+		local v = minV + (maxV - minV) * a
+		v = clamp(snap(v), minV, maxV)
+		setFn(v)
 	end
 
 	local function refresh()
-		local v = getter()
+		local v = tonumber(getFn()) or minV
 		local a = (v - minV) / (maxV - minV)
 		fill.Size = UDim2.new(clamp(a, 0, 1), 0, 1, 0)
 		valueLbl.Text = tostring(v)
@@ -628,9 +619,7 @@ local function mkSlider(parent: Instance, label: string, minV: number, maxV: num
 	end)
 
 	UserInputService.InputChanged:Connect(function(input)
-		if not dragging then
-			return
-		end
+		if not dragging then return end
 		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
 			local x = input.Position.X
 			local bx = bar.AbsolutePosition.X
@@ -641,9 +630,7 @@ local function mkSlider(parent: Instance, label: string, minV: number, maxV: num
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
-		if not dragging then
-			return
-		end
+		if not dragging then return end
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = false
 			cfg:SaveDebounced(setStatus)
@@ -654,33 +641,67 @@ local function mkSlider(parent: Instance, label: string, minV: number, maxV: num
 	return refresh
 end
 
-local function mkButton(parent: Instance, label: string, text: string, onClick: () -> ())
-	local row = mkRow(parent)
+local function mkTextBox(parent, label, placeholder)
+	local row = mkRow(parent, 42)
 
-	local txt = Instance.new("TextLabel")
+	local txt = Instance.new('TextLabel')
 	txt.Parent = row
 	txt.BackgroundTransparency = 1
 	txt.Position = UDim2.fromOffset(12, 0)
-	txt.Size = UDim2.new(1, -140, 1, 0)
+	txt.Size = UDim2.new(1, -220, 1, 0)
 	txt.Font = Enum.Font.Gotham
 	txt.TextSize = 12
 	txt.TextXAlignment = Enum.TextXAlignment.Left
 	txt.TextColor3 = Color3.fromRGB(225, 225, 225)
 	txt.Text = label
 
-	local btn = Instance.new("TextButton")
+	local box = Instance.new('TextBox')
+	box.Parent = row
+	box.Size = UDim2.fromOffset(200, 24)
+	box.Position = UDim2.new(1, -212, 0.5, -12)
+	box.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	box.BackgroundTransparency = opacity
+	box.BorderSizePixel = 0
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 12
+	box.TextColor3 = Color3.fromRGB(235, 235, 235)
+	box.PlaceholderText = placeholder
+	box.Text = ''
+
+	local cr = Instance.new('UICorner')
+	cr.CornerRadius = UDim.new(0, 8)
+	cr.Parent = box
+
+	return box
+end
+
+local function mkButton(parent, label, text, onClick)
+	local row = mkRow(parent, 42)
+
+	local txt = Instance.new('TextLabel')
+	txt.Parent = row
+	txt.BackgroundTransparency = 1
+	txt.Position = UDim2.fromOffset(12, 0)
+	txt.Size = UDim2.new(1, -160, 1, 0)
+	txt.Font = Enum.Font.Gotham
+	txt.TextSize = 12
+	txt.TextXAlignment = Enum.TextXAlignment.Left
+	txt.TextColor3 = Color3.fromRGB(225, 225, 225)
+	txt.Text = label
+
+	local btn = Instance.new('TextButton')
 	btn.Parent = row
-	btn.Size = UDim2.fromOffset(110, 24)
-	btn.Position = UDim2.new(1, -122, 0.5, -12)
+	btn.Size = UDim2.fromOffset(120, 24)
+	btn.Position = UDim2.new(1, -132, 0.5, -12)
 	btn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-	btn.BackgroundTransparency = themeOpacity()
+	btn.BackgroundTransparency = opacity
 	btn.BorderSizePixel = 0
 	btn.Font = Enum.Font.GothamBold
 	btn.TextSize = 12
+	btn.TextColor3 = Color3.fromRGB(235, 235, 235)
 	btn.Text = text
-	btn.TextColor3 = Color3.fromRGB(230, 230, 230)
 
-	local cr = Instance.new("UICorner")
+	local cr = Instance.new('UICorner')
 	cr.CornerRadius = UDim.new(0, 999)
 	cr.Parent = btn
 
@@ -692,228 +713,160 @@ local function mkButton(parent: Instance, label: string, text: string, onClick: 
 	return btn
 end
 
-local function mkTextBox(parent: Instance, label: string, placeholder: string)
-	local row = mkRow(parent)
+-- =========================
+-- Page contents
+-- =========================
+mkHeader(pageHome, 'Overview')
+mkNote(pageHome, 'UI gọn + save liên tục. Hop server sẽ giữ config qua TeleportData.\nOut game rồi vào lại: không thể giữ nếu không có DataStore/backend.')
 
-	local txt = Instance.new("TextLabel")
-	txt.Parent = row
-	txt.BackgroundTransparency = 1
-	txt.Position = UDim2.fromOffset(12, 0)
-	txt.Size = UDim2.new(1, -200, 1, 0)
-	txt.Font = Enum.Font.Gotham
-	txt.TextSize = 12
-	txt.TextXAlignment = Enum.TextXAlignment.Left
-	txt.TextColor3 = Color3.fromRGB(225, 225, 225)
-	txt.Text = label
+mkHeader(pageAuto, 'AutoFarm Settings')
+mkNote(pageAuto, 'Phần này chỉ là UI + config. Nếu bạn muốn “auto farm hợp lệ” trong game của bạn, dùng server script (file 3/4).')
 
-	local box = Instance.new("TextBox")
-	box.Parent = row
-	box.Size = UDim2.fromOffset(180, 24)
-	box.Position = UDim2.new(1, -192, 0.5, -12)
-	box.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-	box.BackgroundTransparency = themeOpacity()
-	box.BorderSizePixel = 0
-	box.Font = Enum.Font.Gotham
-	box.TextSize = 12
-	box.TextColor3 = Color3.fromRGB(230, 230, 230)
-	box.PlaceholderText = placeholder
-	box.Text = ""
-
-	local cr = Instance.new("UICorner")
-	cr.CornerRadius = UDim.new(0, 8)
-	cr.Parent = box
-
-	return box
-end
-
--- Tabs
-local tabButtons: { [string]: TextButton } = {}
-local tabPages: { [string]: ScrollingFrame } = {
-	Home = pageHome,
-	Settings = pageSettings,
-	Teleport = pageTeleport,
-}
-
-local function setTab(name: string)
-	for tabName, page in pairs(tabPages) do
-		page.Visible = (tabName == name)
-		local b = tabButtons[tabName]
-		if b then
-			b.TextColor3 = (tabName == name) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(170, 170, 170)
-		end
-	end
-
+local function getAF() return (cfg:Get().autofarm or {}) end
+local function setAF(mutator)
 	local c = cfg:Get()
-	c.ui = c.ui or {}
-	c.ui.tab = name
+	c.autofarm = c.autofarm or {}
+	mutator(c.autofarm)
 	cfg:Set(c)
-	cfg:SaveDebounced(setStatus)
 end
 
-local function mkTabButton(name: string)
-	local b = Instance.new("TextButton")
-	b.Parent = sidebar
-	b.Size = UDim2.new(1, 0, 0, 32)
-	b.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-	b.BackgroundTransparency = themeOpacity()
-	b.BorderSizePixel = 0
-	b.Font = Enum.Font.GothamBold
-	b.TextSize = 12
-	b.TextXAlignment = Enum.TextXAlignment.Left
-	b.TextColor3 = Color3.fromRGB(170, 170, 170)
-	b.Text = "  " .. name
+mkToggle(pageAuto, 'Start (Enabled)', function() return getAF().Enabled == true end, function(v)
+	setAF(function(a) a.Enabled = (v == true) end)
+end)
 
-	local cr = Instance.new("UICorner")
-	cr.CornerRadius = UDim.new(0, 10)
-	cr.Parent = b
+mkToggle(pageAuto, 'Boss Only', function() return getAF().BossOnly == true end, function(v)
+	setAF(function(a) a.BossOnly = (v == true) end)
+end)
 
-	b.MouseButton1Click:Connect(function()
-		setTab(name)
-	end)
+mkSlider(pageAuto, 'Radius', 0, 20000, 50, function()
+	return tonumber(getAF().Radius) or DEFAULT.autofarm.Radius
+end, function(v)
+	setAF(function(a) a.Radius = v end)
+end)
 
-	tabButtons[name] = b
-end
+mkSlider(pageAuto, 'Follow Distance', 1, 40, 1, function()
+	return tonumber(getAF().FollowDist) or DEFAULT.autofarm.FollowDist
+end, function(v)
+	setAF(function(a) a.FollowDist = v end)
+end)
 
-mkTabButton("Home")
-mkTabButton("Settings")
-mkTabButton("Teleport")
+mkSlider(pageAuto, 'Attack CD', 0.05, 1.0, 0.05, function()
+	return tonumber(getAF().AttackCD) or DEFAULT.autofarm.AttackCD
+end, function(v)
+	setAF(function(a) a.AttackCD = v end)
+end)
 
--- Content
-mkHeaderText(pageHome, "Quick")
-mkNote(pageHome, "Bật/tắt option. Mọi thay đổi được lưu liên tục và sẽ giữ khi bạn hop server (TeleportData).")
+mkHeader(pageTeleport, 'Teleport / Hop')
+mkNote(pageTeleport, 'Muốn hop mà giữ config: phải teleport kèm TeleportData. Dùng ToRungHubTransport bridge hoặc nút dưới.')
 
-local function cfgToggleGetter(k: string): () -> boolean
-	return function()
-		local c = cfg:Get()
-		return ((c.toggles or {})[k] == true)
+local jobBox = mkTextBox(pageTeleport, 'JobId', 'Paste JobId here')
+
+mkButton(pageTeleport, 'Rejoin (same place)', 'REJOIN', function()
+	cfg:SaveImmediate(setStatus)
+	cfg:Teleport(game.PlaceId, nil)
+end)
+
+mkButton(pageTeleport, 'Hop to JobId', 'HOP', function()
+	local jobId = jobBox.Text
+	if typeof(jobId) == 'string' and #jobId > 0 then
+		cfg:SaveImmediate(setStatus)
+		cfg:Teleport(game.PlaceId, jobId)
 	end
-end
+end)
 
-local function cfgToggleSetter(k: string): (boolean) -> ()
-	return function(v)
-		local c = cfg:Get()
-		c.toggles = c.toggles or {}
-		c.toggles[k] = (v == true)
-		cfg:Set(c)
-	end
-end
-
-local function cfgSliderGetter(k: string): () -> number
-	return function()
-		local c = cfg:Get()
-		local n = tonumber(((c.sliders or {})[k]))
-		return n or DEFAULT_CONFIG.sliders[k]
-	end
-end
-
-local function cfgSliderSetter(k: string): (number) -> ()
-	return function(v)
-		local c = cfg:Get()
-		c.sliders = c.sliders or {}
-		c.sliders[k] = v
-		cfg:Set(c)
-	end
-end
-
-mkToggle(pageHome, "Start (Enabled)", cfgToggleGetter("Enabled"), cfgToggleSetter("Enabled"))
-mkToggle(pageHome, "Option A", cfgToggleGetter("OptionA"), cfgToggleSetter("OptionA"))
-mkToggle(pageHome, "Option B", cfgToggleGetter("OptionB"), cfgToggleSetter("OptionB"))
-mkToggle(pageHome, "Option C", cfgToggleGetter("OptionC"), cfgToggleSetter("OptionC"))
-
-mkHeaderText(pageSettings, "Sliders")
-mkNote(pageSettings, "Bạn có thể đổi tên/ý nghĩa slider theo game của bạn.")
-
-mkSlider(pageSettings, "Radius", 0, 20000, 50, cfgSliderGetter("Radius"), cfgSliderSetter("Radius"))
-mkSlider(pageSettings, "Speed", 0, 200, 1, cfgSliderGetter("Speed"), cfgSliderSetter("Speed"))
-
-mkHeaderText(pageSettings, "UI")
-mkSlider(pageSettings, "Opacity", 0, 0.6, 0.02, function()
+mkHeader(pageSettings, 'UI')
+mkSlider(pageSettings, 'Opacity', 0, 0.6, 0.02, function()
 	local c = cfg:Get()
-	return tonumber(((c.ui or {}).opacity)) or DEFAULT_CONFIG.ui.opacity
+	return clamp(tonumber((c.ui or {}).opacity) or DEFAULT.ui.opacity, 0, 0.6)
 end, function(v)
 	local c = cfg:Get()
 	c.ui = c.ui or {}
 	c.ui.opacity = v
 	cfg:Set(c)
 
-	main.BackgroundTransparency = v
-	top.BackgroundTransparency = v
-	sidebar.BackgroundTransparency = v
+	opacity = v
+	main.BackgroundTransparency = opacity
+	top.BackgroundTransparency = opacity
+	sidebar.BackgroundTransparency = opacity
 end)
 
-mkHeaderText(pageTeleport, "Hop / Teleport")
-mkNote(pageTeleport, "Để giữ config khi hop, hãy teleport kèm TeleportData (script dưới có sẵn).")
+mkNote(pageSettings, 'Hotkey: RightShift (toggle UI). Drag trên topbar để kéo.')
 
-local jobBox = mkTextBox(pageTeleport, "JobId", "Paste JobId here")
+-- =========================
+-- Window controls + persistence of UI state
+-- =========================
+local minimized = (uiCfg.minimized == true)
+local locked = (uiCfg.locked == true)
 
-mkButton(pageTeleport, "Rejoin (same place)", "REJOIN", function()
-	cfg:Teleport(game.PlaceId, nil)
-end)
+local normalSize = UDim2.fromOffset(520, 360)
+local miniSize = UDim2.fromOffset(520, 36)
 
-mkButton(pageTeleport, "Hop to JobId", "HOP", function()
-	local jobId = jobBox.Text
-	if typeof(jobId) == "string" and #jobId > 0 then
-		cfg:Teleport(game.PlaceId, jobId)
-	end
-end)
+local floatBtn = Instance.new('TextButton')
+floatBtn.Parent = gui
+floatBtn.Size = UDim2.fromOffset(44, 44)
+floatBtn.Position = UDim2.new(0, 12, 0, 12)
+floatBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+floatBtn.BackgroundTransparency = 0.2
+floatBtn.BorderSizePixel = 0
+floatBtn.Font = Enum.Font.GothamBold
+floatBtn.TextSize = 14
+floatBtn.TextColor3 = Color3.fromRGB(245, 245, 245)
+floatBtn.Text = 'TR'
+floatBtn.Visible = false
+floatBtn.ZIndex = 10
 
--- Minimize/close/lock + hotkey
-local minimized = false
-local locked = false
-local dragging = false
-local dragStart: Vector2? = nil
-local startPos: UDim2? = nil
+local fbCr = Instance.new('UICorner')
+fbCr.CornerRadius = UDim.new(0, 12)
+fbCr.Parent = floatBtn
 
-local function applyMinimize(on: boolean)
-	minimized = on
-	body.Visible = not minimized
-	main.Size = minimized and UDim2.fromOffset(460, 34) or UDim2.fromOffset(460, 320)
+local function syncShadow()
 	shadow.Size = main.Size
-	btnMin.Text = minimized and "+" or "–"
+	shadow.Position = main.Position + UDim2.fromOffset(6, 6)
+	shadow.Visible = main.Visible
+end
 
+local function saveUiState()
 	local c = cfg:Get()
 	c.ui = c.ui or {}
+	c.ui.visible = (main.Visible == true)
 	c.ui.minimized = minimized
-	cfg:Set(c)
-	cfg:SaveDebounced(setStatus)
-end
-
-local function applyVisible(on: boolean)
-	main.Visible = on
-	shadow.Visible = on
-	local c = cfg:Get()
-	c.ui = c.ui or {}
-	c.ui.visible = on
-	cfg:Set(c)
-	cfg:SaveDebounced(setStatus)
-end
-
-local function applyLock(on: boolean)
-	locked = on
-	btnLock.Text = locked and "🔒" or "🔓"
-	local c = cfg:Get()
-	c.ui = c.ui or {}
 	c.ui.locked = locked
+	c.ui.pos = tblFromUdim2(main.Position)
 	cfg:Set(c)
 	cfg:SaveDebounced(setStatus)
 end
 
-btnClose.MouseButton1Click:Connect(function()
-	applyVisible(false)
-end)
+local function applyMinimize(on)
+	minimized = (on == true)
+	body.Visible = not minimized
+	main.Size = minimized and miniSize or normalSize
+	btnMin.Text = minimized and '+' or '–'
+	syncShadow()
+	saveUiState()
+end
 
-btnMin.MouseButton1Click:Connect(function()
-	applyMinimize(not minimized)
-end)
+local function applyVisible(on)
+	main.Visible = (on == true)
+	floatBtn.Visible = not main.Visible
+	syncShadow()
+	saveUiState()
+end
 
-btnLock.MouseButton1Click:Connect(function()
-	applyLock(not locked)
-end)
+local function applyLock(on)
+	locked = (on == true)
+	btnLock.Text = locked and '🔒' or '🔓'
+	saveUiState()
+end
+
+btnClose.MouseButton1Click:Connect(function() applyVisible(false) end)
+floatBtn.MouseButton1Click:Connect(function() applyVisible(true) end)
+btnMin.MouseButton1Click:Connect(function() applyMinimize(not minimized) end)
+btnLock.MouseButton1Click:Connect(function() applyLock(not locked) end)
+
+local dragging, dragStart, startPos = false, nil, nil
 
 top.InputBegan:Connect(function(input)
-	if locked then
-		return
-	end
+	if locked then return end
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging = true
 		dragStart = input.Position
@@ -922,99 +875,70 @@ top.InputBegan:Connect(function(input)
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-	if not dragging or not dragStart or not startPos then
-		return
-	end
+	if not dragging then return end
 	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
 		local delta = input.Position - dragStart
-		local newPos = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-		main.Position = newPos
-		shadow.Position = newPos + UDim2.fromOffset(6, 6)
+		main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		syncShadow()
 	end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-	if not dragging then
-		return
-	end
+	if not dragging then return end
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging = false
-		dragStart = nil
-		startPos = nil
-
-		local c = cfg:Get()
-		c.ui = c.ui or {}
-		c.ui.pos = tblFromUdim2(main.Position)
-		cfg:Set(c)
-		cfg:SaveDebounced(setStatus)
+		dragStart, startPos = nil, nil
+		saveUiState()
 	end
 end)
 
 UserInputService.InputBegan:Connect(function(input, gp)
-	if gp then
-		return
-	end
+	if gp then return end
 	if input.KeyCode == Enum.KeyCode.RightShift then
 		applyVisible(not main.Visible)
 	end
 end)
 
--- Restore UI state from config
-do
-	local c = cfg:Get()
-	local uiState = c.ui or {}
-	local p = udim2FromTbl(uiState.pos)
-	if p then
-		main.Position = p
-		shadow.Position = p + UDim2.fromOffset(6, 6)
-	end
-	applyLock(uiState.locked == true)
-	applyMinimize(uiState.minimized == true)
-	applyVisible(uiState.visible ~= false)
+-- restore initial state
+applyLock(locked)
+applyMinimize(minimized)
+applyVisible(uiCfg.visible ~= false)
+setTab(tostring(uiCfg.tab or 'Home'))
+syncShadow()
 
-	setTab(tostring(uiState.tab or "Home"))
-end
-
--- Keep shadow always following (safety if other scripts change zindex/pos)
-RunService.RenderStepped:Connect(function()
-	if shadow.Parent ~= gui then
-		shadow.Parent = gui
-	end
-	shadow.Position = main.Position + UDim2.fromOffset(6, 6)
-	shadow.Visible = main.Visible
-end)
+RunService.RenderStepped:Connect(syncShadow)
 
 -- =========================
--- Transport bridge for external hop scripts (client-side)
+-- Bridge for your "hop file"
 -- =========================
-local bf = playerGui:FindFirstChild("ToRungHubTransport")
-if bf then
-	bf:Destroy()
-end
+local transport = pg:FindFirstChild('ToRungHubTransport')
+if transport then transport:Destroy() end
 
-bf = Instance.new("BindableFunction")
-bf.Name = "ToRungHubTransport"
-bf.Parent = playerGui
+transport = Instance.new('BindableFunction')
+transport.Name = 'ToRungHubTransport'
+transport.Parent = pg
 
-bf.OnInvoke = function(action: any, ...)
-	if action == "GetConfig" then
+transport.OnInvoke = function(action, ...)
+	if action == 'GetConfig' then
 		return cfg:Get()
 	end
-	if action == "SetConfig" then
+	if action == 'SetConfig' then
 		local t = ...
-		if typeof(t) == "table" then
+		if typeof(t) == 'table' then
 			cfg:Set(t)
-			cfg:SaveDebounced(setStatus)
+			cfg:SaveImmediate(setStatus)
 			return true
 		end
 		return false
 	end
-	if action == "GetTeleportData" then
+	if action == 'GetTeleportData' then
+		cfg:SaveImmediate(setStatus)
 		return cfg:GetTeleportData()
 	end
-	if action == "Teleport" then
+	if action == 'Teleport' then
 		local placeId, jobId = ...
-		if typeof(placeId) == "number" then
+		if typeof(placeId) == 'number' then
+			cfg:SaveImmediate(setStatus)
 			cfg:Teleport(placeId, jobId)
 			return true
 		end
@@ -1024,39 +948,203 @@ bf.OnInvoke = function(action: any, ...)
 end
 
 
---// =========================================================
---// FILE: Hop_Example.lua  (Optional helper)
---// How to hop while preserving ToRungHub config
---// =========================================================
+-- =========================================================
+-- FILE 2/4: StarterPlayerScripts/Hop_ToRungHub.lua  (LocalScript example)
+-- Example hop script that preserves ToRungHub config via TeleportData
+-- =========================================================
 --[[
-local Players = game:GetService("Players")
-local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService('Players')
+local TeleportService = game:GetService('TeleportService')
 
 local plr = Players.LocalPlayer
-local pg = plr:WaitForChild("PlayerGui")
-local transport = pg:WaitForChild("ToRungHubTransport")
+local pg = plr:WaitForChild('PlayerGui')
+local tr = pg:WaitForChild('ToRungHubTransport')
 
-local jobId = "PASTE_JOB_ID"
+local jobId = 'PASTE_JOB_ID_HERE'
+local td = tr:Invoke('GetTeleportData')
 
--- Option 1: let UI teleport (already packs data)
-transport:Invoke("Teleport", game.PlaceId, jobId)
-
--- Option 2: if your hop script teleports itself
-local td = transport:Invoke("GetTeleportData")
 TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, plr, td)
 ]]
 
 
---// =========================================================
---// FILE: README.md
---// =========================================================
+-- =========================================================
+-- FILE 3/4: ServerScriptService/AutoFarm_ConfigServer.lua  (ServerScript OPTIONAL)
+-- Owner-only sample “auto farm hợp lệ” (chạy trong game bạn).
+-- =========================================================
+
 --[[
-# ToRungHub (client-only UI + hop persistence)
+local Players = game:GetService('Players')
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
+local RunService = game:GetService('RunService')
+local CollectionService = game:GetService('CollectionService')
+local Workspace = game:GetService('Workspace')
 
-- Continuous save: every UI change updates PlayerGui Attribute (same session).
-- Hop persistence: TeleportData keeps config across server-hop/teleport.
-- True out/in persistence requires DataStore/backend (not included).
+local REMOTE_NAME = 'ToRungHubControl'
+local OWNER_ONLY = true
 
-## How to load
-```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/torung1404/torunghub/refs/heads/main/AutoFarm_UI.lua"))()
+local function isOwner(plr)
+	if not OWNER_ONLY then return true end
+	if plr.UserId == game.CreatorId then return true end
+	return false
+end
+
+local function sanitizeConfig(cfg)
+	if typeof(cfg) ~= 'table' then return nil end
+	local a = cfg.autofarm
+	if typeof(a) ~= 'table' then return nil end
+	return {
+		Enabled = (a.Enabled == true),
+		BossOnly = (a.BossOnly == true),
+		Radius = math.clamp(tonumber(a.Radius) or 3000, 0, 20000),
+		FollowDist = math.clamp(tonumber(a.FollowDist) or 6, 1, 40),
+		AttackCD = math.clamp(tonumber(a.AttackCD) or 0.2, 0.05, 1.0),
+	}
+end
+
+local remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if not remote then
+	remote = Instance.new('RemoteEvent')
+	remote.Name = REMOTE_NAME
+	remote.Parent = ReplicatedStorage
+end
+
+local stateByUserId = {} -- userId -> { cfg=table, nextAttack=number }
+
+local MONSTER_FOLDER = Workspace:FindFirstChild('Monsters')
+local MONSTER_TAG = 'Monster'
+local BOSS_TAG = 'Boss'
+
+local function getChar(plr)
+	local c = plr.Character
+	if not c then return nil end
+	local hrp = c:FindFirstChild('HumanoidRootPart')
+	local hum = c:FindFirstChildOfClass('Humanoid')
+	if not (hrp and hum) then return nil end
+	return c, hrp, hum
+end
+
+local function isAliveModel(m)
+	if not (m and m:IsA('Model')) then return false end
+	local hum = m:FindFirstChildOfClass('Humanoid')
+	local hrp = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+	if not (hum and hrp) then return false end
+	if hum.Health <= 0 then return false end
+	return true
+end
+
+local function isBoss(m)
+	if CollectionService:HasTag(m, BOSS_TAG) then return true end
+	return (m.Name or ''):lower():find('boss') ~= nil
+end
+
+local function listMonsters()
+	local out = {}
+	local tagged = CollectionService:GetTagged(MONSTER_TAG)
+	for _, inst in ipairs(tagged) do
+		if inst:IsA('Model') then out[#out+1] = inst end
+	end
+	if #out > 0 then return out end
+	if MONSTER_FOLDER then
+		for _, inst in ipairs(MONSTER_FOLDER:GetChildren()) do
+			if inst:IsA('Model') then out[#out+1] = inst end
+		end
+	end
+	return out
+end
+
+local function bestTarget(hrp, cfg)
+	local best, bestD2 = nil, math.huge
+	local pos = hrp.Position
+	local r2 = cfg.Radius * cfg.Radius
+	for _, m in ipairs(listMonsters()) do
+		if isAliveModel(m) then
+			if (not cfg.BossOnly) or isBoss(m) then
+				local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+				if r then
+					local d = pos - r.Position
+					local d2 = d:Dot(d)
+					if d2 <= r2 and d2 < bestD2 then
+						bestD2 = d2
+						best = m
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+remote.OnServerEvent:Connect(function(plr, action, payload)
+	if not isOwner(plr) then return end
+	if action ~= 'Config' then return end
+	local cfg = sanitizeConfig(payload)
+	if not cfg then return end
+
+	stateByUserId[plr.UserId] = stateByUserId[plr.UserId] or { nextAttack = 0 }
+	stateByUserId[plr.UserId].cfg = cfg
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	stateByUserId[plr.UserId] = nil
+end)
+
+RunService.Heartbeat:Connect(function()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local st = stateByUserId[plr.UserId]
+		if st and st.cfg and st.cfg.Enabled then
+			local _, hrp = getChar(plr)
+			if hrp then
+				local target = bestTarget(hrp, st.cfg)
+				if target then
+					local thrp = target:FindFirstChild('HumanoidRootPart') or target.PrimaryPart
+					local thum = target:FindFirstChildOfClass('Humanoid')
+					if thrp and thum then
+						local goal = (thrp.CFrame * CFrame.new(0, 0, st.cfg.FollowDist)).Position
+						hrp.CFrame = CFrame.new(goal, thrp.Position)
+
+						if os.clock() >= st.nextAttack then
+							st.nextAttack = os.clock() + st.cfg.AttackCD
+							thum:TakeDamage(5) -- TODO: thay bằng logic combat thật của game bạn
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+]]
+
+
+-- =========================================================
+-- FILE 4/4: README.md  (paste into GitHub as README.md)
+-- =========================================================
+--[[
+# ToRungHub (UI + Hop Config Save)
+
+## What you get
+- UI ToRungHub: sidebar + tabs, minimal & does not cover the whole screen
+- Continuous config save (debounced 0.2s) into `PlayerGui` attribute (same session)
+- Hop/Teleport persistence: config is packed into `TeleportData` so hopping servers keeps the same config
+
+## Important limits
+- If you **leave the game and join again later**, client-only storage cannot persist without DataStore/backend.
+- Hop persistence works only if teleport is executed with TeleportData (use the provided bridge).
+
+## Install in Roblox Studio (recommended)
+1) Put `AutoFarm_UI.lua` as a **LocalScript** in:
+   - `StarterPlayer > StarterPlayerScripts`
+2) (Optional) Put `AutoFarm_ConfigServer.lua` as a **Script** in:
+   - `ServerScriptService`
+3) Press Play.
+
+## Hop while keeping config
+Your hop script can do:
+- `PlayerGui.ToRungHubTransport:Invoke("GetTeleportData")` then call TeleportService with that data
+- or simply `Invoke("Teleport", placeId, jobId)`
+
+See `Hop_ToRungHub.lua` for example.
+
+## Rename
+UI name is already `ToRungHub`. You can change it in `AutoFarm_UI.lua`:
+- `HUB_NAME = 'ToRungHub'`
+]]
